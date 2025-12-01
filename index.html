@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Mini Souls-like 3D (Pixel Art) - Single File</title>
+  <!-- Three.js from CDN -->
+  <script src="https://unpkg.com/three@0.154.0/build/three.min.js"></script>
+  <script src="https://unpkg.com/three@0.154.0/examples/js/controls/OrbitControls.js"></script>
+  <style>
+    html,body{height:100%;margin:0;background:#1b1b1b;color:#eee;font-family:Inter,system-ui,monospace}
+    #ui{position:fixed;left:12px;top:12px;z-index:10;max-width:320px}
+    .panel{background:rgba(0,0,0,0.45);padding:10px;border-radius:8px;margin-bottom:8px}
+    canvas{display:block}
+    .hud{position:fixed;left:50%;transform:translateX(-50%);bottom:18px;background:rgba(0,0,0,0.5);padding:8px 12px;border-radius:999px}
+    .bar{height:8px;background:#333;border-radius:8px;overflow:hidden}
+    .bar > .fill{height:100%;background:linear-gradient(90deg,#e74c3c,#e67e22)}
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <div class="panel">
+      <strong>Mini Souls-like (3D, pixel look)</strong>
+      <div>Controles: WASD mover • Mouse girar • Click esquerdo atacar • Espaço esquiva/rolar</div>
+      <div>Inimigos: 3 tipos (Melee, Ranged, Fast) + Mini Elite</div>
+    </div>
+    <div class="panel">
+      <div>Vida: <span id="hpText">100</span></div>
+      <div class="bar" style="width:220px"><div id="hpFill" class="fill" style="width:100%"></div></div>
+    </div>
+  </div>
+
+  <div class="hud">Pressione R para reiniciar</div>
+
+<script>
+// Single-file minimal souls-like prototype using Three.js
+// - Pixel-art look achieved by low-res canvas textures with nearest filtering
+// - Simple 3D third-person with basic combat, attack hit detection and dodge (invul frames)
+// - Enemies: Melee (slow), Ranged (shoots projectiles), Fast (quick but low HP), Elite (stronger)
+
+let scene, camera, renderer, controls;
+let clock = new THREE.Clock();
+let player, enemies = [], projectiles = [];
+let input = { forward:false, back:false, left:false, right:false, attacking:false, dodge:false };
+let attackCooldown = 0;
+let dodgeCooldown = 0;
+let invulnerable = 0;
+let score = 0;
+
+init();
+animate();
+
+function init(){
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x101010);
+
+  camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 1000);
+  camera.position.set(0,6,10);
+
+  renderer = new THREE.WebGLRenderer({antialias:true});
+  renderer.setSize(innerWidth, innerHeight);
+  document.body.appendChild(renderer.domElement);
+
+  controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.enablePan = false; controls.enableZoom = false; controls.maxPolarAngle = Math.PI/2.2; controls.minPolarAngle = Math.PI/3.5;
+
+  // Lights
+  const d = 10;
+  scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+  const dir = new THREE.DirectionalLight(0xffffff, 0.6); dir.position.set(5,10,2); scene.add(dir);
+
+  // Ground
+  const ground = new THREE.Mesh(
+    new THREE.PlaneGeometry(60,60),
+    new THREE.MeshStandardMaterial({color:0x222222})
+  );
+  ground.rotation.x = -Math.PI/2; ground.receiveShadow = true;
+  scene.add(ground);
+
+  // Pixel texture generator (simple colored squares) - returns a THREE.Texture with nearest filter
+  function pixelTexture(color){
+    const size = 16; // low-res for pixel look
+    const canvas = document.createElement('canvas'); canvas.width = canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = color; ctx.fillRect(0,0,size,size);
+    // add pixel shading
+    ctx.fillStyle = shadeColor(color, -12); ctx.fillRect(0,0,size/2,size/2);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.magFilter = THREE.NearestFilter; tex.minFilter = THREE.NearestFilter; tex.generateMipmaps=false;
+    return tex;
+  }
+
+  // Helper shade
+  function shadeColor(c, percent){
+    // c in hex like #rrggbb or named color; convert via canvas
+    const ctx = document.createElement('canvas').getContext('2d'); ctx.fillStyle = c; const col = ctx.fillStyle;
+    // parse rgb(a)
+    const m = col.match(/rgba?\((\d+),(\d+),(\d+)/);
+    if(!m) return col; const r=+m[1], g=+m[2], b=+m[3];
+    const t = (100+percent)/100;
+    return `rgb(${Math.max(0,Math.min(255,Math.round(r*t)))},${Math.max(0,Math.min(255,Math.round(g*t)))},${Math.max(0,Math.min(255,Math.round(b*t)))})`;
+  }
+
+  // Player
+  player = createActor({type:'player', color:'#6ab04c', size:0.9, maxHp:100});
+  player.mesh.position.set(0,0.5,0);
+  scene.add(player.mesh);
+
+  // Simple camera follow offset
+  player.cameraOffset = new THREE.Vector3(0,5,10);
+
+  // Spawn some enemies at start
+  for(let i=0;i<6;i++) spawnEnemy(randomSpawnPos());
+
+  // Input
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', onKeyUp);
+  renderer.domElement.addEventListener('pointerdown', ()=>{ input.attacking = true });
+  renderer.domElement.addEventListener('pointerup', ()=>{ input.attacking = false });
+
+  window.addEventListener('resize', ()=>{ camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+}
+
+function createActor(opts){
+  const geom = new THREE.BoxGeometry(opts.size, opts.size, opts.size);
+  const mat = new THREE.MeshStandardMaterial({map:pixelTexture(opts.color), roughness:0.8});
+  const mesh = new THREE.Mesh(geom, mat);
+  mesh.castShadow = true;
+  return { mesh, hp: opts.maxHp||20, maxHp: opts.maxHp||20, type: opts.type, size: opts.size };
+}
+
+function spawnEnemy(pos, kind=null){
+  const types = ['melee','ranged','fast'];
+  if(kind===null) kind = types[Math.floor(Math.random()*types.length)];
+  // small chance for elite
+  const isElite = Math.random()<0.12;
+  const color = isElite ? '#f1c40f' : (kind=='melee' ? '#e74c3c' : (kind=='ranged' ? '#3498db' : '#9b59b6'));
+  const baseHp = kind=='melee' ? 40 : (kind=='ranged' ? 30 : 20);
+  const size = kind=='fast' ? 0.6 : 0.9;
+  const enemy = createActor({type:kind, color:color, size:size, maxHp: isElite ? baseHp*1.8 : baseHp});
+  enemy.mesh.position.copy(pos);
+  enemy.kind = kind; enemy.isElite = isElite; enemy.speed = kind=='melee'?1.0:(kind=='ranged'?0.7:1.6);
+  enemy.attackTimer = 0; enemy.state = 'idle'; enemy.target = player;
+  enemies.push(enemy); scene.add(enemy.mesh);
+}
+
+function randomSpawnPos(){
+  const angle = Math.random()*Math.PI*2; const r = 8 + Math.random()*10; return new THREE.Vector3(Math.cos(angle)*r,0.5,Math.sin(angle)*r);
+}
+
+function animate(){
+  requestAnimationFrame(animate);
+  const dt = Math.min(0.05, clock.getDelta());
+
+  updatePlayer(dt);
+  updateEnemies(dt);
+  updateProjectiles(dt);
+
+  // camera follow
+  const desired = player.mesh.position.clone().add(player.cameraOffset.clone().applyQuaternion(player.mesh.quaternion));
+  camera.position.lerp(desired, 0.12);
+  camera.lookAt(player.mesh.position.clone().add(new THREE.Vector3(0,1.2,0)));
+
+  renderer.render(scene, camera);
+}
+
+function updatePlayer(dt){
+  // Movement
+  const dir = new THREE.Vector3();
+  if(input.forward) dir.z -= 1; if(input.back) dir.z += 1; if(input.left) dir.x -= 1; if(input.right) dir.x += 1;
+  if(dir.lengthSq()>0){ dir.normalize(); // rotate with camera yaw
+    const yaw = getCameraYaw();
+    const forward = new THREE.Vector3(Math.sin(yaw),0,Math.cos(yaw));
+    const right = new THREE.Vector3().crossVectors(new THREE.Vector3(0,1,0), forward).normalize();
+    const move = forward.multiplyScalar(-dir.z).add(right.multiplyScalar(dir.x)).normalize();
+    player.mesh.position.add(move.multiplyScalar(4*dt));
+    // rotate player to movement
+    player.mesh.lookAt(player.mesh.position.clone().add(move));
+  }
+
+  // Attack
+  attackCooldown -= dt; if(input.attacking && attackCooldown<=0){ performAttack(); attackCooldown = 0.6; }
+  // Dodge
+  dodgeCooldown -= dt; if(input.dodge && dodgeCooldown<=0){ performDodge(); dodgeCooldown = 1.2; }
+
+  // invul frames decrement
+  invulnerable = Math.max(0, invulnerable - dt);
+
+  // update UI
+  document.getElementById('hpText').innerText = Math.max(0, Math.round(player.hp));
+  document.getElementById('hpFill').style.width = `${(player.hp/player.maxHp)*100}%`;
+
+  // Respawn enemies occasionally
+  if(enemies.length<4 && Math.random()<0.01) spawnEnemy(randomSpawnPos());
+}
+
+function getCameraYaw(){
+  const v = camera.position.clone().sub(player.mesh.position); v.y=0; v.normalize(); return Math.atan2(v.x, v.z);
+}
+
+function performAttack(){
+  // Simple arc in front of player — damage enemies inside cone
+  const origin = player.mesh.position.clone();
+  const forward = new THREE.Vector3(); player.mesh.getWorldDirection(forward);
+  const range = 2.0; const arc = Math.PI/3; const damage = 18;
+  enemies.forEach((e)=>{
+    const to = e.mesh.position.clone().sub(origin); to.y=0; const d = to.length(); if(d>range) return;
+    const ang = forward.angleTo(to.normalize()); if(ang<=arc/2){
+      e.hp -= damage * (e.isElite?1.2:1);
+      e.mesh.position.add(forward.clone().multiplyScalar(0.2));
+      spawnHitEffect(e.mesh.position);
+    }
+  });
+}
+
+function performDodge(){
+  // short dash forward + invulnerability
+  const forward = new THREE.Vector3(); player.mesh.getWorldDirection(forward);
+  player.mesh.position.add(forward.multiplyScalar(2.0)); invulnerable = 0.9;
+  // small visual
+  const splash = new THREE.Mesh(new THREE.PlaneGeometry(1.2,1.2), new THREE.MeshBasicMaterial({map:pixelCircleTexture('#ffffff',8),transparent:true,opacity:0.3}));
+  splash.position.copy(player.mesh.position).y=0.51; splash.rotation.x=-Math.PI/2; scene.add(splash);
+  setTimeout(()=>scene.remove(splash),220);
+}
+
+function pixelCircleTexture(color,size){
+  const s = size; const c = document.createElement('canvas'); c.width=c.height=s; const ctx=c.getContext('2d');
+  ctx.fillStyle=color; ctx.beginPath(); ctx.arc(s/2,s/2,s/2-1,0,Math.PI*2); ctx.fill();
+  const t = new THREE.CanvasTexture(c); t.magFilter=THREE.NearestFilter; t.minFilter=THREE.NearestFilter; t.generateMipmaps=false; return t;
+}
+
+function spawnHitEffect(pos){
+  const p = new THREE.Mesh(new THREE.PlaneGeometry(0.6,0.6), new THREE.MeshBasicMaterial({map:pixelCircleTexture('#fffbf0',6),transparent:true}));
+  p.position.copy(pos); p.position.y = 1.0; p.rotation.x=-Math.PI/2; scene.add(p);
+  setTimeout(()=>scene.remove(p),150);
+}
+
+function updateEnemies(dt){
+  for(let i=enemies.length-1;i>=0;i--){
+    const e = enemies[i];
+    if(e.hp<=0){ // death
+      scene.remove(e.mesh); enemies.splice(i,1); score+=10; continue;
+    }
+    const toPlayer = player.mesh.position.clone().sub(e.mesh.position); toPlayer.y=0; const dist = toPlayer.length();
+    const dir = toPlayer.clone().normalize();
+    // simple AI
+    if(e.kind=='melee'){
+      if(dist>1.8) e.mesh.position.add(dir.multiplyScalar(e.speed*dt)); else { e.attackTimer-=dt; if(e.attackTimer<=0){ enemyAttack(e); e.attackTimer = 1.2; } }
+    } else if(e.kind=='ranged'){
+      if(dist>6) e.mesh.position.add(dir.multiplyScalar(e.speed*dt)); else if(dist<3) e.mesh.position.add(dir.multiplyScalar(-e.speed*dt));
+      e.attackTimer -= dt; if(e.attackTimer<=0){ rangedShoot(e); e.attackTimer = 1.6; }
+    } else if(e.kind=='fast'){
+      if(dist>1.2) e.mesh.position.add(dir.multiplyScalar(e.speed*dt)); else { e.attackTimer-=dt; if(e.attackTimer<=0){ enemyAttack(e); e.attackTimer = 0.9; } }
+    }
+    // simple look at player
+    e.mesh.lookAt(player.mesh.position.clone());
+  }
+}
+
+function enemyAttack(e){
+  // melee: check collision with player
+  const d = e.mesh.position.distanceTo(player.mesh.position);
+  if(d<1.6 && invulnerable<=0){ player.hp -= (e.isElite?16:8); spawnHitEffect(player.mesh.position); if(player.hp<=0) onPlayerDeath(); }
+}
+
+function rangedShoot(e){
+  // spawn projectile
+  const dir = player.mesh.position.clone().sub(e.mesh.position).normalize();
+  const proj = { pos: e.mesh.position.clone(), dir, speed:8 + (e.isElite?1:0), dmg: e.isElite?14:7, life:3 };
+  const g = new THREE.Mesh(new THREE.BoxGeometry(0.2,0.2,0.2), new THREE.MeshBasicMaterial({map:pixelTexture('#ffd166')}));
+  g.position.copy(proj.pos); scene.add(g); proj.mesh = g; projectiles.push(proj);
+}
+
+function updateProjectiles(dt){
+  for(let i=projectiles.length-1;i>=0;i--){
+    const p = projectiles[i]; p.pos.add(p.dir.clone().multiplyScalar(p.speed*dt)); p.mesh.position.copy(p.pos);
+    p.life -= dt; if(p.life<=0){ scene.remove(p.mesh); projectiles.splice(i,1); continue; }
+    if(p.pos.distanceTo(player.mesh.position) < 0.9 && invulnerable<=0){ player.hp -= p.dmg; spawnHitEffect(player.mesh.position); scene.remove(p.mesh); projectiles.splice(i,1); if(player.hp<=0) onPlayerDeath(); }
+  }
+}
+
+function onPlayerDeath(){
+  alert('Você morreu! Score: '+score); location.reload();
+}
+
+// collisions: simple check to keep actors above ground
+
+// Utility random
+function rand(a,b){ return a + Math.random()*(b-a); }
+
+// Keyboard handlers
+function onKeyDown(e){ if(e.repeat) return; switch(e.code){
+  case 'KeyW': input.forward=true; break; case 'KeyS': input.back=true; break; case 'KeyA': input.left=true; break; case 'KeyD': input.right=true; break;
+  case 'Space': input.dodge=true; break; case 'KeyR': location.reload(); break;
+}}
+function onKeyUp(e){ switch(e.code){ case 'KeyW': input.forward=false; break; case 'KeyS': input.back=false; break; case 'KeyA': input.left=false; break; case 'KeyD': input.right=false; break; case 'Space': input.dodge=false; break; }}
+
+// Simple pixel-texture helper reused outside createActor
+function pixelTexture(color){
+  const size = 16; const canvas = document.createElement('canvas'); canvas.width=canvas.height=size; const ctx=canvas.getContext('2d');
+  ctx.fillStyle=color; ctx.fillRect(0,0,size,size);
+  const tex = new THREE.CanvasTexture(canvas); tex.magFilter=THREE.NearestFilter; tex.minFilter=THREE.NearestFilter; tex.generateMipmaps=false; return tex;
+}
+
+// Small instruction to spawn extra enemies with keys
+window.addEventListener('keydown', (e)=>{ if(e.key==='1') spawnEnemy(randomSpawnPos(),'melee'); if(e.key==='2') spawnEnemy(randomSpawnPos(),'ranged'); if(e.key==='3') spawnEnemy(randomSpawnPos(),'fast'); if(e.key==='4') spawnEnemy(randomSpawnPos(), null); });
+
+</script>
+</body>
+</html>
